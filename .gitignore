@@ -134,3 +134,6 @@ Streamlit/.streamlit
 
 #.DS_Store
 .DS_Store
+
+#GCP creds
+Airflow/big_data_pipeline_cred.json

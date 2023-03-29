@@ -28,10 +28,10 @@ def query_database(query):
         print("Failed to query record from table {}".format(error))
 
 def get_processed_recording_name():              
-    result=query_database("SELECT ID,Recording_Name FROM Recording_Details")
+    result=query_database("SELECT DISTINCT Recording_Name FROM Recording_Details")
     recording_names=[]
     for row in result:
-        recording_names.append((row[0],row[1]))
+        recording_names.append((row))
     return recording_names
 
 def get_selected_questions(recording_name,index):
@@ -81,7 +81,7 @@ with st.form("Upload_form", clear_on_submit=True):
 
 option = st.selectbox(
     'Select the recording you want to analyze',
-    (recording_name[1] for recording_name in get_processed_recording_name()))
+    (recording_name[0] for recording_name in get_processed_recording_name()))
 
 st.write('You selected:', option)
 
