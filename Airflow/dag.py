@@ -8,12 +8,14 @@ import os
 import pymysql
 import whisper
 import openai
+import json
 from pydub import AudioSegment
 import pendulum
 from airflow.providers.google.cloud.hooks.gcs import GCSHook
 from airflow.providers.mysql.hooks.mysql import MySqlHook
 from airflow.hooks.base_hook import BaseHook
 from google.auth.credentials import AnonymousCredentials
+from airflow.models.param import Param
 
 openai.api_key = os.getenv("open_api_key")
 default_args = {
@@ -23,45 +25,17 @@ default_args = {
     'retries': 1,
     'retry_delay': timedelta(minutes=5),
 }
-
+recording_details = {"recording_name" : Param("Short_song",type='string'),}
 
 dag = DAG(
-    'short_song_transcription',
+    'damg7245-a4-pipeline',
     default_args=default_args,
-    description='Transcription of short song recording',
+    description='Transcription of recording',
     schedule_interval=timedelta(days=1),
     catchup=False
 )
 
 #Util functions
-# def init_gcp_bucket():
-#     os.environ["GOOGLE_APPLICATION_CREDENTIALS"]="big_data_pipeline_cred.json"
-#     storage_client = storage.Client()
-#     return storage_client
-
-# def init_gcp_bucket():
-#     credentials = BaseHook.get_connection("my_gcp_creds").extra_dejson
-#     creds = None
-    
-#     # Check if credentials are provided and not empty
-#     if credentials:
-#         creds = credentials.get("keyfile_path")
-
-#     # Use Google Application Default Credentials (ADC) if no credentials are provided
-#     storage_client = storage.Client.from_service_account_json(creds) if creds else storage.Client(
-#         credentials=AnonymousCredentials()
-#     )
-    
-#     return storage_client
-
-# def init_gcp_bucket():
-#     # Get the credentials from Airflow Admin Connection
-#     credentials = BaseHook.get_connection("my_gcp_creds").extra_dejson
-    
-#     # Set the credentials
-#     storage_client = storage.Client(credentials=credentials)
-#     return storage_client
-
 def init_gcp_bucket():
     # Get the credentials from Airflow Admin Connection'
     your_gcp_keys = { 
@@ -76,19 +50,21 @@ def init_gcp_bucket():
         "auth_provider_x509_cert_url": os.environ.get('auth_provider_x509_cert_url'),
         "client_x509_cert_url": os.environ.get('client_x509_cert_url')
     }
-    # gcp_hook = GoogleCloudBaseHook(gcp_conn_id='my_gcp_creds')
-    # credentials = gcp_hook._get_credentials()
     
     # Set the credentials
     credentials = service_account.Credentials.from_service_account_info(your_gcp_keys)
     storage_client = storage.Client(credentials=credentials)
     return storage_client
 
-def upload_objects(folder,object):
+def upload_objects(folder,**kwargs):
+    ti = kwargs['ti']
+    file_name = ti.xcom_pull(key='file_name', task_ids=['download_recording'])[0]
+    folder += f'{file_name}.txt'
+    object_n = f'{file_name}.txt'
     storage_client=init_gcp_bucket()
     bucket = storage_client.get_bucket(os.getenv("bucket_name")) 
     blob = bucket.blob(folder)
-    blob.upload_from_filename(object)
+    blob.upload_from_filename(object_n)
 
 def get_transcripts_objects(file_name):
     storage_client=init_gcp_bucket()
@@ -110,22 +86,26 @@ def write_database(Recording_Name,Q1,Q2,Q3,Q4):
         cursor.execute(sql_insert,record)
         conn.commit()
         cursor.close()
-        os.remove("recording.mp3")
-        os.remove("Short_song.txt")
     except Exception as error:
         print("Failed to insert record into table {}".format(error))
  
         
-def get_recordings_objects(recording_name):
+def get_recordings_objects(**kwargs):
+    recording_name = kwargs['dag_run'].conf['recording_name']
     storage_client=init_gcp_bucket()
+    print(recording_name)
     bucket = storage_client.get_bucket(os.getenv("bucket_name"))
     blob_name = f"recording/{recording_name}.mp3"
     blob=bucket.blob(blob_name)
     blob.download_to_filename("recording.mp3")
+    ti = kwargs['ti']
+    ti.xcom_push(key='file_name', value=recording_name)
 
 
-def transcribe_audio(file_path,file="recording.mp3"):
+def transcribe_audio(file="recording.mp3",**kwargs):
     # Convert the MP3 file to WAV format
+    ti = kwargs['ti']
+    file_path = ti.xcom_pull(key='file_name', task_ids=['download_recording'])[0]
     os.environ["PATH"] += os.pathsep + '/usr/bin/ffmpeg'
     sound = AudioSegment.from_mp3(file)
     sound.export('/tmp/audio.wav', format= 'wav')
@@ -134,12 +114,7 @@ def transcribe_audio(file_path,file="recording.mp3"):
         transcription=openai.Audio.transcribe(api_key=openai.api_key, model=model_id, file=audio_file, response_format='text')
         file_text = open(f"{file_path}.txt", "w")
         file_text.write(transcription)
-        return transcription
-    # model = whisper.load_model("tiny")
-    # transcribed_audio = model.transcribe(file)
-    # file_text = open(f"{file_path}.txt", "w")
-    # file_text.write(transcribed_audio['text'])
-    # return transcribed_audio['text']
+        ti.xcom_push(key='transcript', value=transcription)
 
 def chat_gpt(query,prompt):
     response_summary =  openai.ChatCompletion.create(
@@ -150,31 +125,39 @@ def chat_gpt(query,prompt):
     )
     return response_summary['choices'][0]['message']['content']
     
-def query_chat_gpt(prompt):
+def query_chat_gpt(**kwargs):
+    #global transcript 
+    ti = kwargs['ti']
+    prompt = ti.xcom_pull(key='transcript', task_ids=['transcribe_audio'])[0]
+    print(prompt)
     #Query1
-    query1='give the summary in 1000 character: '
+    query1='give the summary in 700 character: '
     q1=chat_gpt(prompt,query1)
     ##Query2
-    query2="what is the mood or emotion in the text not more than 1000 character? "
+    query2="what is the mood or emotion in the text in less than 700 character? "
     q2=chat_gpt(prompt,query2)
     ##Query3
-    query3="what are the main keywords not more than 1000 character? "
+    query3="what are the main keywords in less than 700 character? "
     q3=chat_gpt(prompt,query3)
     ##Query4
-    query4="What should be the next steps not more than 1000 character?"
+    query4="What should be the next steps in less than 700 character?"
     q4=chat_gpt(prompt,query4)
-    write_database("Short_song",q1,q2,q3,q4)
-
-# t0 = BashOperator(
-#     task_id='install_dependencies',
-#     bash_command='pip install -r ./requirements.txt',
-#     dag=dag
-# )
+    file_name=ti.xcom_pull(key='file_name', task_ids=['download_recording'])[0]
+    write_database(file_name,q1,q2,q3,q4)
+    os.remove("recording.mp3")
+    os.remove(f"{file_name}.txt")
+    
+t0 = BashOperator(
+    task_id='install_ffmpeg',
+    bash_command='sudo apt-get update && sudo apt-get -y install ffmpeg',
+    dag=dag)
 
 t1 = PythonOperator(
     task_id='download_recording',
     python_callable=get_recordings_objects,
-    op_kwargs={'recording_name': 'Short_song'},
+    #config=json.dumps({'op_kwargs': {'recording_name': 'Short_song'}}),
+    #op_kwargs={'recording_name': 'Short_song'},
+    #op_kwargs=json.loads(recording_name),
     dag=dag,
     provide_context=True,
 )
@@ -182,7 +165,6 @@ t1 = PythonOperator(
 t2 = PythonOperator(
     task_id='transcribe_audio',
     python_callable=transcribe_audio,
-    op_kwargs={'file_path': 'Short_song'},
     dag=dag,
     provide_context=True,
 )
@@ -190,7 +172,7 @@ t2 = PythonOperator(
 t3 = PythonOperator(
     task_id='upload_transcript',
     python_callable=upload_objects,
-    op_kwargs={'folder': 'transcript/Short_song.txt', 'object': 'Short_song.txt'},
+    op_kwargs={'folder': 'transcript/'},
     dag=dag,
     provide_context=True,
 )
@@ -198,10 +180,9 @@ t3 = PythonOperator(
 t4 = PythonOperator(
     task_id='query_chat_gpt',
     python_callable=query_chat_gpt,
-    op_kwargs={'prompt': get_transcripts_objects('Short_song')},
+    #op_kwargs={'prompt': transcript},
     dag=dag,
     provide_context=True,
 )
 
-
-t1 >> t2 >> t3 >> t4
+t0 >> t1 >> t2 >> t3 >> t4
