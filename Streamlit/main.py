@@ -4,6 +4,10 @@ from google.cloud import storage
 from google.oauth2 import service_account
 import tempfile
 import pymysql
+import openai
+
+
+openai.api_key = st.secrets["open_api_key"]
 
 #Util functions
 def database_conn():
@@ -52,6 +56,25 @@ def get_selected_questions(recording_name,index):
     except Exception as error:
         print("Failed to query questions from table {}".format(error))
 
+def download_object(recording_name,prompt):
+    credentials = service_account.Credentials.from_service_account_info(st.secrets["gcp_service_account"])
+    storage_client = storage.Client(credentials=credentials)
+    bucket = storage_client.get_bucket(st.secrets["bucket_name"])
+    blob_name = f"transcript/{recording_name}.txt"
+    blob=bucket.blob(blob_name)
+    transcript=blob.download_as_string()
+    ans=chat_gpt(transcript,prompt)
+    return ans
+
+def chat_gpt(query,prompt):
+    response_summary =  openai.ChatCompletion.create(
+        model = "gpt-3.5-turbo", 
+        messages = [
+            {"role" : "user", "content" : f'{query} {prompt}'}
+        ]
+    )
+    return response_summary['choices'][0]['message']['content']
+    
 with st.form("Upload_form", clear_on_submit=True):
         uploaded_file=st.file_uploader("Choose an audio file",type=['mp3','m4a','wav'],accept_multiple_files=False)
         submitted = st.form_submit_button("Upload Recording")
@@ -85,10 +108,17 @@ option = st.selectbox(
 
 st.write('You selected:', option)
 
-question_options= ("Q1. What is the summary of the audio file?" , "Q2. What is the emotion in the recording?" , "Q4. What are the keywords in the recording?" ,"Q5. What could be the next possible steps?")
+question_options= ("Q1. What is the summary of the audio file?" , "Q2. What is the emotion in the recording?" , "Q4. What are the keywords in the recording?" ,"Q4. What could be the next possible steps?")
 question_dropdown = st.selectbox(
     'Select the question',question_options)
 selected_index= question_options.index(question_dropdown)
 
 if st.button("Query for answer?"):
     st.write(get_selected_questions(option,selected_index))
+    
+input_prompt=st.text_input(
+        "Enter your question ",
+        key="placeholder",
+)
+if st.button("Query"):
+    st.write(download_object(option,input_prompt))

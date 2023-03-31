@@ -25,13 +25,12 @@ default_args = {
     'retries': 1,
     'retry_delay': timedelta(minutes=5),
 }
-recording_details = {"recording_name" : Param("Short_song",type='string'),}
 
 dag = DAG(
-    'damg7245-a4-pipeline',
+    'damg7245-a4-pipeline_batch',
     default_args=default_args,
     description='Transcription of recording',
-    schedule_interval=timedelta(days=1),
+    schedule_interval=timedelta(minutes=5),
     catchup=False
 )
 
@@ -57,14 +56,27 @@ def init_gcp_bucket():
     return storage_client
 
 def upload_objects(folder,**kwargs):
-    ti = kwargs['ti']
-    file_name = ti.xcom_pull(key='file_name', task_ids=['download_recording'])[0]
-    folder += f'{file_name}.txt'
-    object_n = f'{file_name}.txt'
+    # ti = kwargs['ti']
+    # file_name = ti.xcom_pull(key='file_name', task_ids=['download_recording'])[0]
+    files= list_all_file()
+    for file in files:
+        folder += f'{file}.txt'
+        object_n = f'{file}.txt'
+        storage_client=init_gcp_bucket()
+        bucket = storage_client.get_bucket(os.getenv("bucket_name")) 
+        blob = bucket.blob(folder)
+        blob.upload_from_filename(object_n)
+
+def list_all_file():
+    files_list=[]
     storage_client=init_gcp_bucket()
+    # Get the bucket object
     bucket = storage_client.get_bucket(os.getenv("bucket_name")) 
-    blob = bucket.blob(folder)
-    blob.upload_from_filename(object_n)
+    # Iterate through all the blobs in the bucket
+    for blob in bucket.list_blobs(prefix='recording/'):
+        # Print the name of the file
+       files_list.append(str(blob.name).split('/')[1].split('.')[0])
+    return files_list
 
 def get_transcripts_objects(file_name):
     storage_client=init_gcp_bucket()
@@ -88,6 +100,8 @@ def write_database(Recording_Name,Q1,Q2,Q3,Q4):
         cursor.close()
     except Exception as error:
         print("Failed to insert record into table {}".format(error))
+    # finally:
+    #     move_recording()
 
 def move_recording(**kwargs):
     ti = kwargs['ti']
@@ -102,30 +116,36 @@ def move_recording(**kwargs):
     source_blob.delete()
         
 def get_recordings_objects(**kwargs):
-    recording_name = kwargs['dag_run'].conf['recording_name']
+    #recording_name = kwargs['dag_run'].conf['recording_name']
+    recordings=list_all_file()
     storage_client=init_gcp_bucket()
-    print(recording_name)
-    bucket = storage_client.get_bucket(os.getenv("bucket_name"))
-    blob_name = f"recording/{recording_name}.mp3"
-    blob=bucket.blob(blob_name)
-    blob.download_to_filename("recording.mp3")
+    file_names=[]
+    for recording_name in recordings:
+        print(recording_name)
+        bucket = storage_client.get_bucket(os.getenv("bucket_name"))
+        blob_name = f"recording/{recording_name}.mp3"
+        blob=bucket.blob(blob_name)
+        blob.download_to_filename(f"{recording_name}.mp3")
     ti = kwargs['ti']
-    ti.xcom_push(key='file_name', value=recording_name)
+    ti.xcom_push(key='file_name', value=recordings)
 
-
-def transcribe_audio(file="recording.mp3",**kwargs):
+def transcribe_audio(**kwargs):
     # Convert the MP3 file to WAV format
     ti = kwargs['ti']
-    file_path = ti.xcom_pull(key='file_name', task_ids=['download_recording'])[0]
+    #file_path = ti.xcom_pull(key='file_name', task_ids=['download_recording'])[0]
+    recordings=list_all_file()
+    transcribe_list=[]
     os.environ["PATH"] += os.pathsep + '/usr/bin/ffmpeg'
-    sound = AudioSegment.from_mp3(file)
-    sound.export('/tmp/audio.wav', format= 'wav')
-    model_id = 'whisper-1'
-    with open('/tmp/audio.wav','rb') as audio_file:
-        transcription=openai.Audio.transcribe(api_key=openai.api_key, model=model_id, file=audio_file, response_format='text')
-        file_text = open(f"{file_path}.txt", "w")
-        file_text.write(transcription)
-        ti.xcom_push(key='transcript', value=transcription)
+    for recording in recordings:
+        sound = AudioSegment.from_mp3(f"{recording}.mp3")
+        sound.export(f'/tmp/{recording}.wav', format= 'wav')
+        model_id = 'whisper-1'
+        with open(f'/tmp/{recording}.wav','rb') as audio_file:
+            transcription=openai.Audio.transcribe(api_key=openai.api_key, model=model_id, file=audio_file, response_format='text')
+            file_text = open(f"{recording}.txt", "w")
+            file_text.write(transcription)
+            transcribe_list.append(transcription)
+    ti.xcom_push(key='transcripts', value=transcribe_list)
 
 def chat_gpt(query,prompt):
     response_summary =  openai.ChatCompletion.create(
@@ -139,33 +159,35 @@ def chat_gpt(query,prompt):
 def query_chat_gpt(**kwargs):
     #global transcript 
     ti = kwargs['ti']
-    prompt = ti.xcom_pull(key='transcript', task_ids=['transcribe_audio'])[0]
-    print(prompt)
-    #Query1
-    query1='give the summary in 700 character: '
-    q1=chat_gpt(prompt,query1)
-    ##Query2
-    query2="what is the mood or emotion in the text in less than 700 character? "
-    q2=chat_gpt(prompt,query2)
-    ##Query3
-    query3="what are the main keywords in less than 700 character? "
-    q3=chat_gpt(prompt,query3)
-    ##Query4
-    query4="What should be the next steps in less than 700 character?"
-    q4=chat_gpt(prompt,query4)
-    file_name=ti.xcom_pull(key='file_name', task_ids=['download_recording'])[0]
-    write_database(file_name,q1,q2,q3,q4)
-    os.remove("recording.mp3")
-    os.remove(f"{file_name}.txt")
-    #remove file from object store
-    storage_client=init_gcp_bucket()
-    bucket = storage_client.get_bucket(os.getenv("bucket_name"))
-    blob_name = f"recording/{file_name}.mp3"
-    source_blob = bucket.blob(blob_name)
-    # copy to new destination
-    bucket.copy_blob(source_blob, bucket, f"processed/{file_name}.mp3")
-    # delete in old destination
-    source_blob.delete()
+    prompts = ti.xcom_pull(key='transcripts', task_ids=['transcribe_audio'])[0]
+    print(prompts)
+    recordings=list_all_file()
+    for i,prompt in enumerate(prompts):
+        #Query1
+        query1='give the summary in 700 character: '
+        q1=chat_gpt(prompt,query1)
+        ##Query2
+        query2="what is the mood or emotion in the text in less than 700 character? "
+        q2=chat_gpt(prompt,query2)
+        ##Query3
+        query3="what are the main keywords in less than 700 character? "
+        q3=chat_gpt(prompt,query3)
+        ##Query4
+        query4="What should be the next steps in less than 700 character?"
+        q4=chat_gpt(prompt,query4)
+        file_name=ti.xcom_pull(key='file_name', task_ids=['download_recording'])[0]
+        write_database(recordings[i],q1,q2,q3,q4)
+        os.remove(f"{recordings[i]}.mp3")
+        os.remove(f"{recordings[i]}.txt")
+        #remove file from object store
+        storage_client=init_gcp_bucket()
+        bucket = storage_client.get_bucket(os.getenv("bucket_name"))
+        blob_name = f"recording/{recordings[i]}.mp3"
+        source_blob = bucket.blob(blob_name)
+        # copy to new destination
+        bucket.copy_blob(source_blob, bucket, f"processed/{recordings[i]}.mp3")
+        # delete in old destination
+        source_blob.delete()
     
 t0 = BashOperator(
     task_id='install_ffmpeg',
